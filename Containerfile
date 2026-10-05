@@ -15,6 +15,7 @@
 #
 # See: https://github.com/ggml-org/whisper.cpp
 #   https://github.com/ggml-org/whisper.cpp/blob/master/.devops/main-cuda.Dockerfile
+#   https://github.com/ggml-org/whisper.cpp/blob/master/.devops/main-vulkan.Dockerfile
 #
 # Get the current upstream Container file:
 #   GHFILE='https://raw.githubusercontent.com/ggml-org/whisper.cpp/heads/master/.devops/main-cuda.Dockerfile'
@@ -70,23 +71,29 @@ RUN true \
     -DCMAKE_CUDA_ARCHITECTURES='86-real;120a-real' \
   && nice cmake --build build --config Release --parallel "$(nproc)"
 
-RUN find /app/build -name "*.o" -delete && \
-    find /app/build -name "*.a" -delete && \
-    rm -rf /app/build/CMakeFiles && \
-    rm -rf /app/build/cmake_install.cmake && \
-    rm -rf /app/build/_deps
+# Stage executables and shared libraries, excluding tests and legacy aliases.
+RUN mkdir -p /runtime/usr/local/bin /runtime/usr/local/lib && \
+    for path in build/bin/*; do \
+      name="${path##*/}"; \
+      case "$name" in \
+        *.so|*.so.*) cp -a "$path" /runtime/usr/local/lib/ ;; \
+        test-*|main|bench) ;; \
+        *) cp -a "$path" /runtime/usr/local/bin/ ;; \
+      esac; \
+    done
 
 
 FROM ${BASE_CUDA_RUN_CONTAINER} AS runtime
 WORKDIR /app
 
 RUN apt-get update && \
-  apt-get install -y curl ffmpeg wget cmake git libsdl2-2.0-0 \
-  && apt-get clean \
-  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+    apt-get install --no-install-recommends -y \
+      ca-certificates curl ffmpeg wget libsdl2-2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-COPY --from=build /app /app
-RUN du -sh /app/*
-RUN find /app -type f -size +100M
-ENV PATH=/app/build/bin:$PATH
-ENTRYPOINT [ "bash", "-c" ]
+COPY --from=build /runtime/ /
+COPY --from=build /app/models/download-* /usr/local/bin/
+RUN ldconfig
+
+# Clear the entrypoint inherited from the NVIDIA CUDA base image.
+ENTRYPOINT []
