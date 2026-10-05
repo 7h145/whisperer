@@ -81,16 +81,17 @@ mapfile -t LOCALIMAGES < <(
 # container name
 CNAME='whisper'
 
-PMARGS_VOLUMES=(
-  '--volume' "${CNAME}.models:/models"
-)
-
 PMARGS_MISC=(
   #'--interactive' '--tty'
   #'--detach'
   #'--replace'
   '--rm'
   #'--cpus=2' #'--memory=256m'
+  '--entrypoint=bash'
+)
+
+PMARGS_VOLUMES=(
+  '--volume' "${CNAME}.models:/models"
 )
 
 case "${IMAGE}" in
@@ -107,50 +108,6 @@ esac
 # timezone
 [[ -r '/etc/timezone' ]] && PMARGS_ENV+=( '--env' "TZ=$(</etc/timezone)" )
 
-# commandline arguments for the container payload
-
-ENTRYPOINT_SERVER='/app/build/bin/whisper-server'
-ENTRYPOINT_STREAM='/app/build/bin/whisper-stream'
-ENTRYPOINT_CLI='/app/build/bin/whisper-cli'
-ENTRYPOINT_DOWNLOAD_GGML='/app/models/download-ggml-model.sh'
-ENTRYPOINT_DOWNLOAD_VAD='/app/models/download-vad-model.sh'
-
-PMARGS_PUBLISH_SERVER=(
-  # whisper.cpp whisper-server runs on 8080/tcp by default
-
-  #'--publish' "${DEFAULT_PORT}:8080"
-  '--publish' "127.0.0.1:${DEFAULT_PORT}:8080"
-)
-
-CMDARGV_SERVER=(
-  '--host' '0.0.0.0'
-  # mimic OpenAI API endpoint path, whisper.cpp default is /inference
-  '--inference-path' '/v1/audio/transcriptions'
-  '--convert'
-  '--model' "${DEFAULT_MODEL}"
-  '--vad' '--vad-model' "${DEFAULT_VAD}"
-)
-
-CMDARGV_STREAM=(
-  '--model' "${DEFAULT_MODEL}"
-  '--step' '0'				# default is 1
-  #'--step' '300'           # abstract art, for recreational purposes
-  #'--length' '30000'		# default is 30000
-  '--threads' '8'			# default is 6
-  #'--vad-thold' '0.6'		# default is 0.6
-  '--language' 'auto'		# default is "en"
-  '--max-tokens' '64'		# default is 32
-
-  # use '-f transcript.txt' in $* instead
-  #'--file' 'transcript.txt'
-
-  # speaker turn detection requires a '-tdrz' model.  The only one in
-  # whisper.cpp-s current model set is 'ggml-small.en-tdrz.bin'.
-  # Unfortunately, "small" and "en" (only) is not worth the trouble.
-  #'--tinydiarize'
-)
-
-
 [[ -n "${1}" ]] && { COMMAND="${1}"; shift; }
 case "${COMMAND:-server}" in
   '-h'|'--help'|'help')
@@ -158,19 +115,54 @@ case "${COMMAND:-server}" in
   ;;
 
   'server')
+    WHISPER_TOOL='whisper-server'
     PMARGS_MISC+=( '--name' "${CNAME:-whisper}-server" '--replace' )
-    declare -n ENTRYPOINT='ENTRYPOINT_SERVER'
-    declare -n CMDARGV='CMDARGV_SERVER'
-    declare -n PMARGS_PUBLISH='PMARGS_PUBLISH_SERVER'
+
+    CMDARGV=(
+      '--host' '0.0.0.0'
+      # mimic OpenAI API endpoint path, whisper.cpp default is /inference
+      '--inference-path' '/v1/audio/transcriptions'
+      '--convert'
+      '--model' "${DEFAULT_MODEL}"
+      '--vad' '--vad-model' "${DEFAULT_VAD}"
+    )
+
+    # additional positional parameters, maybe?
+    #CMDARGV+=( "${@}" ); shift "${#}"
+
+    # whisper.cpp whisper-server runs on 8080/tcp by default, $DEFAULT_PORT
+    # is an arbitrary free local port
+    PMARGS_PUBLISH+=( '--publish' "127.0.0.1:${DEFAULT_PORT:-51149}:8080" )
   ;;
 
   'stream')
+    WHISPER_TOOL='whisper-stream'
+    PMARGS_MISC+=( '--name' "${CNAME:-whisper}-stream" '--replace' )
+
+    CMDARGV=(
+      '--model' "${DEFAULT_MODEL}"
+      '--step' '0'				# default is 1
+      #'--step' '300'           # abstract art, for recreational purposes
+      #'--length' '30000'		# default is 30000
+      '--threads' '8'			# default is 6
+      #'--vad-thold' '0.6'		# default is 0.6
+      '--language' 'auto'		# default is "en"
+      '--max-tokens' '64'		# default is 32
+
+      # use '-f transcript.txt' in $* instead
+      #'--file' 'transcript.txt'
+
+      # speaker turn detection requires a '-tdrz' model.  The only one in
+      # whisper.cpp-s current model set is 'ggml-small.en-tdrz.bin'.
+      # Unfortunately, "small" and "en" (only) is not worth the trouble.
+      #'--tinydiarize'
+    )
+
+    # additional positional parameters, most notably '-f transcript.txt'
+    CMDARGV+=( "${@}" ); shift "${#}"
+
     # audio source to capture: monitor of the default PulseAudio sink
     PASOURCE="$(pactl get-default-sink).monitor"
-
-    PMARGS_MISC+=( '--name' "${CNAME:-whisper}-stream" '--replace' )
-    declare -n ENTRYPOINT='ENTRYPOINT_STREAM'
-    declare -n CMDARGV='CMDARGV_STREAM'
 
     PMARGS_VOLUMES+=( '--volume' "${XDG_RUNTIME_DIR}/pulse:/run/host-pulse" )
     PMARGS_MISC+=( '--env' 'PULSE_SERVER=unix:/run/host-pulse/native' )
@@ -179,15 +171,13 @@ case "${COMMAND:-server}" in
 
     PMARGS_VOLUMES+=( '--volume' "${PWD}:/stage" )
     PMARGS_MISC+=( '--workdir' '/stage' )
-
-    # most notably '-f transcript.txt'
-    CMDARGV+=( "${@}" ); shift "${#}"
   ;;
 
   'cli')
     # this mounts $PWD into the container for input/output files; use
     # only relative paths inside $PWD.
-    declare -n ENTRYPOINT='ENTRYPOINT_CLI'
+    WHISPER_TOOL='whisper-cli'
+
     PMARGS_VOLUMES+=( '--volume' "${PWD}:/stage" )
     PMARGS_MISC+=( '--workdir' '/stage' )
 
@@ -196,7 +186,8 @@ case "${COMMAND:-server}" in
   ;;
 
   'download-ggml-model'|'ggml')
-    declare -n ENTRYPOINT='ENTRYPOINT_DOWNLOAD_GGML'
+    WHISPER_TOOL='download-ggml-model.sh'
+
     if (( $# == 1 )); then
       CMDARGV=( "${1}" '/models' ); shift "${#}"
     else
@@ -208,12 +199,13 @@ case "${COMMAND:-server}" in
   ;;
 
   'ggml-usage')
-    declare -n ENTRYPOINT='ENTRYPOINT_DOWNLOAD_GGML'
+    WHISPER_TOOL='download-ggml-model.sh'
     unset CMDARGV
   ;;
 
   'download-vad-model'|'vad')
-    declare -n ENTRYPOINT='ENTRYPOINT_DOWNLOAD_VAD'
+    WHISPER_TOOL='download-vad-model.sh'
+
     if (( $# == 1 )); then
       CMDARGV=( "${1}" '/models' ); shift "${#}"
     else
@@ -222,9 +214,9 @@ case "${COMMAND:-server}" in
       exit 1
     fi
   ;;
-  
+
   'vad-usage')
-    declare -n ENTRYPOINT='ENTRYPOINT_DOWNLOAD_VAD'
+    WHISPER_TOOL='download-vad-model.sh'
     unset CMDARGV
   ;;
 
@@ -234,10 +226,13 @@ case "${COMMAND:-server}" in
   ;;
 esac
 
-[[ -n "${ENTRYPOINT}" ]] && {
-  mapfile -t ENTRYPOINT < <(printf '"%s"\n' "${ENTRYPOINT[@]}")
-  PMARGS_MISC+=( "--entrypoint=[$(IFS=','; echo "${ENTRYPOINT[*]}")]" )
-}
+CMDARGV=(
+  # Inline entrypoint: bash -c receives the tool as $0 and its arguments as $@.
+  # Append legacy tool/model-script directories to the image's $PATH.
+  '-c' 'PATH=${PATH}:/app/build/bin:/app/models; exec "${0}" "${@}"'
+  "${WHISPER_TOOL:?}"
+  "${CMDARGV[@]}"
+)
 
 PMARGV=(
   ${PMARGS_MISC:+"${PMARGS_MISC[@]}"}
@@ -247,12 +242,10 @@ PMARGV=(
   ${PMARGS_PUBLISH:+"${PMARGS_PUBLISH[@]}"}
 )
 
-PMCMD=(
-  podman run "${@}" "${PMARGV[@]}" "${IMAGE}" ${CMDARGV:+"${CMDARGV[@]}"}
-)
+PMCMD=( podman run "${@}" "${PMARGV[@]}" "${IMAGE}" "${CMDARGV[@]}" )
 
 # debug
-echo "${PMCMD[@]}" >&2
+#echo "${PMCMD[@]}" >&2
 
 exec "${PMCMD[@]}"
 
