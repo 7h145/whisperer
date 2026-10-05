@@ -1,0 +1,7 @@
+# gitignore(5)
+
+/.agents
+/.pi
+
+/AGENTS.md
+
